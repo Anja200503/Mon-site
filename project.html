@@ -1,0 +1,373 @@
+<!doctype html>
+
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>1D Cut Optimization — Offline HTML</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,Segoe UI,Roboto,'Helvetica Neue',Arial}
+    body{margin:0;padding:20px;background:#f6f7fb;color:#111}
+    .card{background:#fff;border-radius:12px;padding:16px;margin-bottom:14px;box-shadow:0 6px 18px rgba(20,20,50,0.06)}
+    h1{margin:0 0 8px;font-size:20px}
+    label{display:block;margin-top:8px;font-size:13px}
+    input[type=number], input[type=text], select{width:100%;padding:8px;border-radius:8px;border:1px solid #ddd}
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    th,td{padding:8px;border-bottom:1px solid #eee;text-align:left}
+    button{background:#2563eb;color:#fff;border:0;padding:10px 12px;border-radius:10px;cursor:pointer}
+    button.secondary{background:#666}
+    .row{display:flex;gap:8px}
+    .col{flex:1}
+    .small{font-size:12px;color:#666}
+    .muted{color:#666}
+    pre{background:#0b1220;color:#e6eef8;padding:12px;border-radius:8px;overflow:auto}
+    .result-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+    .badge{display:inline-block;padding:6px 8px;border-radius:999px;background:#eef2ff;color:#1e3a8a;font-weight:600}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>1D Cut Optimization (Offline HTML)</h1>
+    <div class="small">Create cutting plans for raw stock (bars) to satisfy item demands. Works fully in your browser. Use on phone or PC.</div>
+  </div>  <div class="card">
+    <label>Stock length</label>
+    <input id="stockLength" type="number" min="0.0001" step="0.01" value="6" /><div style="margin-top:12px;display:flex;gap:8px;align-items:center">
+  <button id="addItemBtn">Add item</button>
+  <button id="generatePatternsBtn" class="secondary">Generate patterns</button>
+  <button id="runGreedyBtn">Run Greedy</button>
+  <button id="runExactBtn">Run Exact (small instances)</button>
+  <div style="margin-left:auto" class="muted">Patterns auto-updated on generation</div>
+</div>
+
+<table id="itemsTable">
+  <thead><tr><th>Item ID</th><th>Length</th><th>Demand</th><th></th></tr></thead>
+  <tbody></tbody>
+</table>
+
+  </div>  <div class="card">
+    <h2 style="margin-top:0">Patterns</h2>
+    <div class="small">Feasible ways to cut one stock (sorted by waste ascending).</div>
+    <div id="patternsCount" class="badge" style="margin-top:8px">0 patterns</div>
+    <div style="margin-top:8px;max-height:260px;overflow:auto">
+      <table id="patternsTable"><thead><tr><th>Pattern</th><th>Composition</th><th>Used</th><th>Waste</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>  <div class="card">
+    <h2 style="margin-top:0">Results</h2>
+    <div class="result-grid" id="resultsArea"></div>
+  </div>  <div class="card">
+    <h2 style="margin-top:0">Export / Save</h2>
+    <div class="small">You can export the plan as JSON (copy/save) or download as CSV.</div>
+    <div style="margin-top:8px;display:flex;gap:8px">
+      <button id="exportJson">Export JSON</button>
+      <button id="downloadCsv" class="secondary">Download CSV</button>
+    </div>
+  </div>  <script>
+    // Simple 1D cut optimization offline HTML
+
+    const itemsTableBody = document.querySelector('#itemsTable tbody');
+    const patternsTableBody = document.querySelector('#patternsTable tbody');
+    const patternsCountBadge = document.getElementById('patternsCount');
+    const resultsArea = document.getElementById('resultsArea');
+
+    function createItemRow(id='A', length=2, demand=1) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><input class="itemId" type="text" value="${id}" /></td>
+        <td><input class="itemLen" type="number" step="0.01" min="0.0001" value="${length}" /></td>
+        <td><input class="itemDem" type="number" step="1" min="0" value="${demand}" /></td>
+        <td><button class="removeBtn secondary">Remove</button></td>
+      `;
+      tr.querySelector('.removeBtn').addEventListener('click',()=>{tr.remove();generatePatterns();});
+      itemsTableBody.appendChild(tr);
+      return tr;
+    }
+
+    document.getElementById('addItemBtn').addEventListener('click',()=>{
+      const nextId = String.fromCharCode(65 + itemsTableBody.children.length % 26);
+      createItemRow(nextId, 1, 1);
+    });
+
+    // init with example
+    createItemRow('A',2,2);
+    createItemRow('B',1.5,1);
+    createItemRow('C',0.5,2);
+
+    function readItems(){
+      const rows = Array.from(itemsTableBody.children);
+      const items = rows.map(r=>({
+        id: r.querySelector('.itemId').value.trim() || '?',
+        length: parseFloat(r.querySelector('.itemLen').value) || 0,
+        demand: Math.max(0,Math.floor(parseFloat(r.querySelector('.itemDem').value) || 0))
+      }));
+      // filter out invalid
+      return items.filter(it=>it.length>0 && it.demand>=0);
+    }
+
+    // Generate feasible patterns (combinations of counts that fit in stock)
+    function generatePatterns(){
+      const stock = parseFloat(document.getElementById('stockLength').value) || 0;
+      const items = readItems();
+      patternsTableBody.innerHTML = '';
+      if(stock <= 0 || items.length===0) { patternsCountBadge.textContent = '0 patterns'; return []; }
+
+      const maxCounts = items.map(it=>Math.floor(stock / it.length));
+      const patterns = [];
+
+      function rec(idx, counts, remaining){
+        if(idx === items.length){
+          if(counts.some(c=>c>0)){
+            const used = counts.reduce((s,c,i)=>s + c*items[i].length, 0);
+            patterns.push({counts:counts.slice(), used, waste: +(stock-used).toFixed(6)});
+          }
+          return;
+        }
+        const maxC = Math.min(maxCounts[idx], Math.floor(remaining / items[idx].length));
+        for(let c=0;c<=maxC;c++){
+          counts.push(c);
+          rec(idx+1, counts, remaining - c*items[idx].length);
+          counts.pop();
+        }
+      }
+      rec(0, [], stock);
+      // sort by waste ascending then by used desc
+      patterns.sort((a,b)=> a.waste - b.waste || b.used - a.used);
+
+      // render
+      patterns.forEach((p,i)=>{
+        const tr = document.createElement('tr');
+        const comp = p.counts.map((c,idx)=> c? `${c}×${items[idx].id}`:null).filter(Boolean).join(', ');
+        tr.innerHTML = `<td>P${i+1}</td><td>${comp||'-'}</td><td>${p.used}</td><td>${p.waste}</td>`;
+        patternsTableBody.appendChild(tr);
+      });
+
+      patternsCountBadge.textContent = `${patterns.length} patterns`;
+      return {patterns, items, stock};
+    }
+
+    document.getElementById('generatePatternsBtn').addEventListener('click', ()=>{
+      generatePatterns();
+      resultsArea.innerHTML='';
+    });
+
+    // Greedy solver: choose pattern that covers most unmet demand units (weighted) or minimal waste
+    function runGreedy(){
+      const data = generatePatterns();
+      if(!data) return;
+      const {patterns, items, stock} = data;
+      if(patterns.length===0){ alert('No patterns available. Check stock length and items.'); return; }
+
+      // unmet demands array
+      const demand = items.map(it=>it.demand);
+      const usedPatterns = Array(patterns.length).fill(0);
+
+      function scorePattern(p){
+        // score = number of demanded units it will cover (sum min(count, unmet))
+        let score=0;
+        for(let i=0;i<items.length;i++){
+          score += Math.min(p.counts[i], demand[i]);
+        }
+        // prefer lower waste in ties
+        return {score, waste: p.waste};
+      }
+
+      // while unmet demand exists
+      let iter=0;
+      while(demand.some(d=>d>0) && iter<10000){
+        iter++;
+        // choose best pattern by score/waste
+        let bestIdx=-1, bestScore=-1, bestWaste=1e9;
+        for(let i=0;i<patterns.length;i++){
+          const s = scorePattern(patterns[i]);
+          if(s.score>bestScore || (s.score===bestScore && s.waste<bestWaste)){
+            bestScore = s.score; bestIdx = i; bestWaste = s.waste;
+          }
+        }
+        if(bestScore<=0){
+          // no pattern covers remaining demand -> can't satisfy
+          break;
+        }
+        usedPatterns[bestIdx]++;
+        // reduce demand
+        for(let k=0;k<items.length;k++){
+          const reduce = Math.min(patterns[bestIdx].counts[k], demand[k]);
+          demand[k] -= reduce;
+        }
+      }
+
+      const totalStocks = usedPatterns.reduce((s,x)=>s+x,0);
+      const unmet = demand.slice();
+      const plan = usedPatterns.map((cnt,i)=>({patternIndex:i, count:cnt, pattern:patterns[i]})).filter(p=>p.count>0);
+      showResult({method:'Greedy',plan,items,stock,totalStocks,unmet});
+    }
+
+    document.getElementById('runGreedyBtn').addEventListener('click', runGreedy);
+
+    // Exact solver (branch-and-bound over patterns) - only for small instances
+    function runExact(){
+      const data = generatePatterns();
+      if(!data) return;
+      const {patterns, items, stock} = data;
+      const numPatterns = patterns.length;
+      const totalDemandUnits = items.reduce((s,it)=>s+it.demand,0);
+
+      // safety checks
+      if(numPatterns>200 || totalDemandUnits>20){
+        if(!confirm('Exact solver can be slow for many patterns or high total demand. Proceed?')) return;
+      }
+
+      // Best solution holder
+      let best = {stocks: Infinity, used: null};
+
+      // Precompute pattern coverage per item
+      const cover = patterns.map(p=>p.counts);
+
+      // Recursive search: try counts for each pattern (0..upperBound)
+      // Upper bound for pattern usage is sum demands (worst case) or best-1 for pruning
+      const upperBound = totalDemandUnits;
+
+      // heuristic initial bound: run greedy to get initial best
+      const greedyResult = (()=>{
+        const demand = items.map(it=>it.demand);
+        const used = Array(numPatterns).fill(0);
+        while(demand.some(d=>d>0)){
+          // choose pattern covering most unmet
+          let bestI=-1,bestCov=0;
+          for(let i=0;i<numPatterns;i++){
+            let cov=0; for(let j=0;j<items.length;j++) cov += Math.min(cover[i][j], demand[j]);
+            if(cov>bestCov){bestCov=cov; bestI=i}
+          }
+          if(bestCov===0) break;
+          used[bestI]++;
+          for(let j=0;j<items.length;j++) demand[j] = Math.max(0, demand[j]-cover[bestI][j]);
+        }
+        return {used, stocks: used.reduce((s,x)=>s+x,0)};
+      })();
+      if(greedyResult.stocks < best.stocks) best = {stocks: greedyResult.stocks, used: greedyResult.used.slice()};
+
+      // Backtracking with pruning
+      const demandInit = items.map(it=>it.demand);
+
+      function canPrune(currentStocks, remainingDemand){
+        if(currentStocks >= best.stocks) return true;
+        // trivial lower bound: ceil( sum(remaining demand lengths) / stock ) using lengths
+        let remLength = 0; for(let j=0;j<items.length;j++) remLength += remainingDemand[j]*items[j].length;
+        const lb = Math.ceil(remLength / stock);
+        return (currentStocks + lb >= best.stocks);
+      }
+
+      // order patterns by efficiency (descending) to speed search
+      const order = patterns.map((p,i)=>({i,eff: p.used>0 ? p.used / (p.waste+0.000001) : 0})).sort((a,b)=>b.eff - a.eff).map(x=>x.i);
+
+      function dfs(idx, currentStocks, remainingDemand, usedCounts){
+        // If all demand satisfied
+        if(remainingDemand.every(d=>d<=0)){
+          if(currentStocks < best.stocks){ best = {stocks: currentStocks, used: usedCounts.slice()}; }
+          return;
+        }
+        if(idx >= order.length) return;
+        if(canPrune(currentStocks, remainingDemand)) return;
+
+        const i = order[idx];
+        // compute max useful times to use this pattern: limited by remaining demand per item
+        let maxUse = Infinity;
+        for(let j=0;j<items.length;j++){
+          const c = cover[i][j];
+          if(c>0) maxUse = Math.min(maxUse, Math.ceil(remainingDemand[j]/c));
+        }
+        if(!isFinite(maxUse)) maxUse = 0; // pattern doesn't cover any remaining -> skip
+        maxUse = Math.min(maxUse, upperBound);
+
+        // try from maxUse down to 0 (favor using more of good patterns earlier)
+        for(let use = maxUse; use>=0; use--){
+          const newUsed = usedCounts.slice(); newUsed[i] = (newUsed[i]||0) + use;
+          const newDemand = remainingDemand.map((d,j)=>d - cover[i][j]*use);
+          dfs(idx+1, currentStocks + use, newDemand, newUsed);
+          // pruning if currentStocks already >= best
+          if(currentStocks >= best.stocks) break;
+        }
+      }
+
+      dfs(0,0,demandInit.map(x=>x), Array(numPatterns).fill(0));
+
+      if(best.stocks===Infinity){ alert('No feasible exact solution found (infeasible with given patterns)'); return; }
+
+      const plan = best.used.map((cnt,i)=>({patternIndex:i,count:cnt,pattern:patterns[i]})).filter(p=>p.count>0);
+      const unmet = items.map((it,idx)=>{
+        const covered = plan.reduce((s,p)=> s + (p.pattern.counts[idx] * p.count), 0);
+        return Math.max(0, it.demand - covered);
+      });
+
+      showResult({method:'Exact',plan,items,stock,totalStocks:best.stocks,unmet});
+    }
+
+    document.getElementById('runExactBtn').addEventListener('click', runExact);
+
+    function showResult({method,plan,items,stock,totalStocks,unmet}){
+      resultsArea.innerHTML = '';
+      const summary = document.createElement('div'); summary.className='card';
+      summary.innerHTML = `<h3 style="margin-top:0">Result — ${method}</h3>
+        <div class="small">Total raw stocks used: <strong>${totalStocks}</strong></div>
+        <div class="small" style="margin-top:6px">Unmet demand per item: ${items.map((it,idx)=>`${it.id}: ${unmet[idx]}`).join(' | ')}</div>
+        `;
+      resultsArea.appendChild(summary);
+
+      const planCard = document.createElement('div'); planCard.className='card';
+      planCard.innerHTML = `<h4 style="margin-top:0">Cut Plan</h4>`;
+      const tbl = document.createElement('table');
+      tbl.innerHTML = `<thead><tr><th>Pattern</th><th>Count</th><th>Composition</th><th>UsedLength</th><th>Waste</th></tr></thead><tbody></tbody>`;
+      plan.forEach(p=>{
+        const tr = document.createElement('tr');
+        const comp = p.pattern.counts.map((c,idx)=> c? `${c}×${items[idx].id}`:null).filter(Boolean).join(', ');
+        tr.innerHTML = `<td>P${p.patternIndex+1}</td><td>${p.count}</td><td>${comp||'-'}</td><td>${p.pattern.used}</td><td>${p.pattern.waste}</td>`;
+        tbl.querySelector('tbody').appendChild(tr);
+      });
+      planCard.appendChild(tbl);
+      resultsArea.appendChild(planCard);
+
+      // detailed per stock listing
+      const listing = document.createElement('div'); listing.className='card';
+      listing.innerHTML = `<h4 style="margin-top:0">Expanded stock list (one row per raw stock)</h4>`;
+      const tb2 = document.createElement('table'); tb2.innerHTML = `<thead><tr><th>#RawStock</th><th>Pattern</th><th>Composition</th><th>Used</th><th>Waste</th></tr></thead><tbody></tbody>`;
+      let idx=1;
+      plan.forEach(p=>{
+        for(let k=0;k<p.count;k++){
+          const tr = document.createElement('tr');
+          const comp = p.pattern.counts.map((c,ii)=> c? `${c}×${items[ii].id}`:null).filter(Boolean).join(', ');
+          tr.innerHTML = `<td>${idx++}</td><td>P${p.patternIndex+1}</td><td>${comp||'-'}</td><td>${p.pattern.used}</td><td>${p.pattern.waste}</td>`;
+          tb2.querySelector('tbody').appendChild(tr);
+        }
+      });
+      listing.appendChild(tb2);
+      resultsArea.appendChild(listing);
+    }
+
+    // export JSON and CSV
+    document.getElementById('exportJson').addEventListener('click', ()=>{
+      const data = generatePatterns(); if(!data) return;
+      const {patterns, items, stock} = data;
+      // if results present, capture plan
+      const planTables = Array.from(resultsArea.querySelectorAll('table'));
+      // build simple export of items+patterns
+      const exportData = {stock, items, patterns};
+      const text = JSON.stringify(exportData, null, 2);
+      // show in new window for copy
+      const w = window.open('', '_blank'); w.document.write('<pre>'+ text.replace(/</g,'&lt;') +'</pre>');});
+
+document.getElementById('downloadCsv').addEventListener('click', ()=>{
+  const data = generatePatterns(); if(!data) return;
+  const {patterns, items, stock} = data;
+  // flatten patterns into CSV
+  const header = ['Pattern','UsedLength','Waste', ...items.map(it=>it.id)].join(',') + '\n';
+  const rows = patterns.map((p,i)=> [ 'P'+(i+1), p.used, p.waste, ...p.counts ].join(',')).join('\n');
+  const csv = header + rows;
+  const blob = new Blob([csv], {type:'text/csv'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download='patterns.csv'; a.click(); URL.revokeObjectURL(url);
+});
+
+// Generate patterns on load
+generatePatterns();
+
+  </script>
+</body>
+</html>
